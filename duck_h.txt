@@ -1,0 +1,30 @@
+// image_matching.h
+
+#ifndef DUCK_H
+#define DUCK_H
+
+#include <vector>
+#include <string>
+#include <opencv2/opencv.hpp>
+
+// Declare the namespace to be used in the header
+using namespace cv;
+using namespace std;
+
+// Function declarations:
+
+vector<double> computeRedSegmentationFeatures(const Mat& image);
+vector<double> computeShapeFeatures(const Mat& image, const vector<double>& redFeatures);
+vector<double> computeFeatures(const Mat& image);
+double computeDistance(const vector<double>& features1, const vector<double>& features2);
+vector<double> computeHistogramFeatures(const Mat& image);
+double computeHistogramDistance(const vector<double>& hist1, const vector<double>& hist2);
+pair<vector<double>, vector<double>> computeTopBottomHistograms(const Mat& image);
+vector<double> computeTextureFeatures(const Mat& image);
+double computeCustomDistance(const vector<double>& targetFeatures, const vector<double>& imageFeatures);
+double computeWeightedHistogramDistance(const vector<double>& targetFeatures, const vector<double>& imageFeatures);
+int readCsv(const string& filename, vector<string>& filenames, vector<vector<double>>& features);
+double computeCosineSimilarity(const vector<double>& vec1, const vector<double>& vec2);
+string getFilename(const string& path);
+
+#endif 

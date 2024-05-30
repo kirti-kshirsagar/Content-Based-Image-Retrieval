@@ -1,0 +1,542 @@
+/*
+Project-2
+Kirti Kshirsagar
+This program is used to compare the images and find the top N matching images based on the distance metric.
+*/
+#include <iostream>
+#include <vector>
+#include <string>
+#include <fstream>
+#include <sstream>
+#include <cmath>
+#include <algorithm>
+#include <opencv2/opencv.hpp>
+#include "duck.h"
+
+
+using namespace std;
+using namespace cv;
+
+/*
+Computes the red color segmentation features of an image.
+The features are based on the proportion of the image that is covered by the red color.
+Arguments:
+- image: An OpenCV Mat image in which to compute red color segmentation features.
+Returns:
+- A vector containing the red area ratio as its only element.
+*/
+vector<double> computeRedSegmentationFeatures(const Mat& image) {
+    Mat hsvImage;
+    cvtColor(image, hsvImage, COLOR_BGR2HSV);
+    Mat lowerRedMask, upperRedMask;
+    // Define HSV range for lower red
+    inRange(hsvImage, Scalar(0, 70, 50), Scalar(10, 255, 255), lowerRedMask);
+    // Define HSV range for upper red
+    inRange(hsvImage, Scalar(170, 70, 50), Scalar(180, 255, 255), upperRedMask);
+    // Combine both masks to get the final mask for red colors
+    Mat redMask = lowerRedMask | upperRedMask;
+    // Morphological operations to reduce noise in the mask
+    Mat kernel = getStructuringElement(MORPH_ELLIPSE, Size(5, 5));
+    morphologyEx(redMask, redMask, MORPH_OPEN, kernel);
+    morphologyEx(redMask, redMask, MORPH_CLOSE, kernel);
+    // Compute features based on the redMask
+    // Example feature: percentage of the image that is red
+    double redAreaRatio = countNonZero(redMask) / static_cast<double>(image.cols * image.rows);
+    return vector<double>{redAreaRatio};
+}
+
+/*
+Computes basic shape features from an image.
+The current implementation uses the count of detected contours as the shape feature.
+Arguments:
+- image: An OpenCV Mat image from which to compute shape features.
+- redFeatures: A vector of doubles representing red segmentation features.
+Returns:
+- A vector containing the count of contours as its only element.
+*/
+vector<double> computeShapeFeatures(const Mat& image, const vector<double>& redFeatures) {
+    Mat hsvImage;
+    cvtColor(image, hsvImage, COLOR_BGR2HSV);
+    Mat lowerRedMask, upperRedMask;
+    inRange(hsvImage, Scalar(0, 70, 50), Scalar(10, 255, 255), lowerRedMask);
+    inRange(hsvImage, Scalar(170, 70, 50), Scalar(180, 255, 255), upperRedMask);
+    Mat redMask = lowerRedMask | upperRedMask;
+    vector<vector<Point>> contours;
+    vector<Vec4i> hierarchy;
+    findContours(redMask, contours, hierarchy, RETR_TREE, CHAIN_APPROX_SIMPLE);
+    // used the count of contours as a basic feature
+    double contourCount = contours.size();
+    return vector<double>{contourCount};
+}
+
+
+
+/*
+Computes features from a central 7x7 square of the image.
+Arguments:
+- image: An OpenCV Mat image from which to extract the feature vector.
+Returns:
+- A vector of doubles representing the pixel values in the 7x7 square.
+*/
+vector<double> computeFeatures(const Mat& image) {
+    // Extract the 7x7 square in the middle
+    Rect roi(image.cols / 2 - 3, image.rows / 2 - 3, 7, 7);
+    Mat roiImage = image(roi);
+    // Flatten the 7x7 square into a feature vector
+    vector<double> features;
+    for (int i = 0; i < roiImage.rows; i++) {
+        for (int j = 0; j < roiImage.cols; j++) {
+            features.push_back(static_cast<double>(roiImage.at<uchar>(i, j)));
+        }
+    }
+    return features;
+}
+
+/*
+Computes the sum-of-squared-difference distance between two feature vectors.
+Arguments:
+- features1: A vector of doubles representing the first feature vector.
+- features2: A vector of doubles representing the second feature vector.
+Returns:
+- A double representing the computed distance.
+*/
+double computeDistance(const vector<double>& features1, const vector<double>& features2) {
+    double distance = 0;
+    for (size_t i = 0; i < features1.size(); i++) {
+        distance += pow(features1[i] - features2[i], 2);
+    }
+    return distance;
+}
+
+/*
+Computes the histogram features of an image.
+Arguments:
+- image: An OpenCV Mat image from which to compute the histogram.
+Returns:
+- A vector of doubles representing the flattened histogram of the image.
+*/
+vector<double> computeHistogramFeatures(const Mat& image) {
+    // Convert image to RGB color space
+    Mat rgbImage;
+    cvtColor(image, rgbImage, COLOR_BGR2RGB);
+    // Split the image into channels
+    vector<Mat> channels;
+    split(rgbImage, channels);
+    // Compute histograms for each channel
+    vector<Mat> hist;
+    int histSize = 8; // Number of bins for each channel
+    float range[] = {0, 256}; // Range for each channel
+    const float* histRange = {range};
+    for (const auto& channel : channels) {
+        Mat hist_channel;
+        calcHist(&channel, 1, 0, Mat(), hist_channel, 1, &histSize, &histRange);
+        hist.push_back(hist_channel);
+    }
+    // Normalize histograms
+    for (auto& h : hist) {
+        normalize(h, h, 0, 1, NORM_MINMAX, -1, Mat());
+    }
+    // Flatten the histograms into a single feature vector
+    vector<double> features;
+    for (const auto& h : hist) {
+        features.insert(features.end(), h.begin<float>(), h.end<float>());
+    }
+    return features;
+}
+
+/*
+Computes the histogram intersection distance between two histograms.
+Arguments:
+- hist1: A vector of doubles representing the first histogram.
+- hist2: A vector of doubles representing the second histogram.
+Returns:
+- A double representing the histogram intersection distance.
+*/
+double computeHistogramDistance(const vector<double>& hist1, const vector<double>& hist2) {
+    double intersection = 0;
+    for (size_t i = 0; i < hist1.size(); i++) {
+        intersection += min(hist1[i], hist2[i]);
+    }
+    return 1 - intersection; // Histogram intersection distance is 1 - intersection
+}
+
+/*
+Computes the histograms for the top and bottom halves of an image. Function to compute multiple histograms representing different spatial parts of the image
+Arguments:
+- image: An OpenCV Mat image from which to compute the histograms.
+Returns:
+- A pair of vectors, each containing the flattened histogram of the top and bottom halves respectively.
+*/
+pair<vector<double>, vector<double>> computeTopBottomHistograms(const Mat& image) {
+    // Compute the top and bottom halves of the image
+    Rect topRect(0, 0, image.cols, image.rows / 2);
+    Rect bottomRect(0, image.rows / 2, image.cols, image.rows / 2);
+    Mat topImage = image(topRect);
+    Mat bottomImage = image(bottomRect);
+
+    // Compute histograms for the top and bottom halves
+    vector<Mat> topChannels, bottomChannels;
+    split(topImage, topChannels);
+    split(bottomImage, bottomChannels);
+    
+    vector<Mat> topHist, bottomHist;
+    int histSize = 8; // Number of bins for each channel
+    float range[] = {0, 256}; // Range for each channel
+    const float* histRange = {range};
+   
+    for (const auto& channel : topChannels) {
+        Mat hist_channel;
+        calcHist(&channel, 1, 0, Mat(), hist_channel, 1, &histSize, &histRange);
+        topHist.push_back(hist_channel);
+    }
+    for (const auto& channel : bottomChannels) {
+        Mat hist_channel;
+        calcHist(&channel, 1, 0, Mat(), hist_channel, 1, &histSize, &histRange);
+        bottomHist.push_back(hist_channel);
+    }
+    // Normalize histograms
+    for (auto& h : topHist) {
+        normalize(h, h, 0, 1, NORM_MINMAX, -1, Mat());
+    }
+    for (auto& h : bottomHist) {
+        normalize(h, h, 0, 1, NORM_MINMAX, -1, Mat());
+    }
+    // Flatten the histograms into feature vectors
+    vector<double> topFeatures, bottomFeatures;
+    for (const auto& h : topHist) {
+        topFeatures.insert(topFeatures.end(), h.begin<float>(), h.end<float>());
+    }
+    for (const auto& h : bottomHist) {
+        bottomFeatures.insert(bottomFeatures.end(), h.begin<float>(), h.end<float>());
+    }
+    return {topFeatures, bottomFeatures};
+}
+
+/*
+Computes texture features of an image using Sobel filters to detect edges and gradients.
+Arguments:
+- image: An OpenCV Mat image from which to compute the texture features.
+Returns:
+- A vector of doubles representing the normalized histogram of gradient magnitudes.
+*/
+vector<double> computeTextureFeatures(const Mat& image) {
+    // Convert image to grayscale
+    Mat grayImage;
+    cvtColor(image, grayImage, COLOR_BGR2GRAY);
+    // Apply Sobel filters to compute gradient magnitude
+    Mat sobelX, sobelY;
+    Sobel(grayImage, sobelX, CV_16S, 1, 0, 3);
+    Sobel(grayImage, sobelY, CV_16S, 0, 1, 3);
+    // Compute magnitude of gradient
+    Mat magnitude;
+    magnitude = abs(sobelX) + abs(sobelY);
+    // Compute histogram of gradient magnitudes
+    vector<int> hist(256, 0);
+    for (int i = 0; i < magnitude.rows; i++) {
+        for (int j = 0; j < magnitude.cols; j++) {
+            int index = min(255, max(0, static_cast<int>(magnitude.at<short>(i, j))));
+            hist[index]++;
+        }
+    }
+    // Normalize histogram
+    double totalPixels = magnitude.rows * magnitude.cols;
+    vector<double> features;
+    for (int count : hist) {
+        features.push_back(count / totalPixels);
+    }
+    return features;
+}
+
+/*
+Computes a custom distance metric based on the red area ratio and contour count features.
+Arguments:
+- targetFeatures: A vector of doubles representing the features of the target image.
+- imageFeatures: A vector of doubles representing the features of the current image.
+Returns:
+- A double representing the computed distance.
+*/
+double computeCustomDistance(const vector<double>& targetFeatures, const vector<double>& imageFeatures) {
+    // the first element is the red area ratio and the second is the contour count
+    double colorDistance = fabs(targetFeatures[0] - imageFeatures[0]); // Absolute difference in color feature
+    double shapeDistance = fabs(targetFeatures[1] - imageFeatures[1]); // Absolute difference in shape feature
+    // Combine the distances
+    double weightedDistance = 0.5 * colorDistance + 0.5 * shapeDistance; // Equal weighting in this example
+    return weightedDistance;
+}
+
+/*
+Computes the weighted histogram distance, combining color and texture histograms.
+Arguments:
+- targetFeatures: A vector of doubles representing the features of the target image.
+- imageFeatures: A vector of doubles representing the features of the current image.
+Returns:
+- A double representing the weighted distance.
+*/
+double computeWeightedHistogramDistance(const vector<double>& targetFeatures, const vector<double>& imageFeatures) {
+    int numBins = 8; // Number of bins for each channel
+    int colorHistSize = numBins * 3; // Total number of bins for color histogram
+    int textureHistSize = 256; // Total number of bins for texture histogram
+    // Compute histogram distance for color histogram
+    double colorDistance = computeHistogramDistance(
+        vector<double>(targetFeatures.begin(), targetFeatures.begin() + colorHistSize),
+        vector<double>(imageFeatures.begin(), imageFeatures.begin() + colorHistSize)
+    );
+    // Compute histogram distance for texture histogram
+    double textureDistance = computeHistogramDistance(
+        vector<double>(targetFeatures.begin() + colorHistSize, targetFeatures.end()),
+        vector<double>(imageFeatures.begin() + colorHistSize, imageFeatures.end())
+    );
+    // Combine both distances with equal weighting
+    return (colorDistance + textureDistance) / 2.0;
+}
+
+/*
+Reads a CSV file containing image features and filenames, storing them in provided vectors.
+Arguments:
+- filename: A string representing the path to the CSV file.
+- filenames: A reference to a vector of strings to store the filenames read from the CSV.
+- features: A reference to a vector of vector<double> to store the features read from the CSV.
+Returns:
+- An int representing the status code, 0 for success and -1 for failure.
+*/
+int readCsv(const string& filename, vector<string>& filenames, vector<vector<double>>& features) {
+    ifstream file(filename);
+    if (!file.is_open()) {
+        cerr << "Error opening file: " << filename << endl;
+        return -1;
+    }
+
+    string line;
+    while (getline(file, line)) {
+        stringstream linestream(line);
+        string imageName;
+        getline(linestream, imageName, ',');
+        filenames.push_back(imageName);
+
+        vector<double> featureVec;
+        string value;
+        while (getline(linestream, value, ',')) {
+            featureVec.push_back(stod(value));
+        }
+        features.push_back(featureVec);
+    }
+    return 0;
+}
+
+/*
+Computes the cosine similarity between two vectors, interpreting them as multidimensional spatial vectors.
+Arguments:
+- vec1: A vector of doubles representing the first feature vector.
+- vec2: A vector of doubles representing the second feature vector.
+Returns:
+- A double representing the cosine similarity between the two feature vectors.
+*/
+double computeCosineSimilarity(const vector<double>& vec1, const vector<double>& vec2) {
+    double dotProduct = 0.0, normA = 0.0, normB = 0.0;
+    for (unsigned int i = 0; i < vec1.size(); i++) {
+        dotProduct += vec1[i] * vec2[i];
+        normA += vec1[i] * vec1[i];
+        normB += vec2[i] * vec2[i];
+    }
+    return dotProduct / (sqrt(normA) * sqrt(normB));
+}
+
+/*
+Extracts the filename from a given file path.
+Arguments:
+- path: A string representing the full path to the file.
+Returns:
+- A string containing just the filename extracted from the full path.
+*/
+string getFilename(const string& path) {
+    size_t pos = path.find_last_of("/\\");
+    return (pos != string::npos) ? path.substr(pos + 1) : path;
+}
+
+/*
+The main function that orchestrates the image matching process.
+Arguments:
+- argc: An int representing the number of command-line arguments.
+- argv: An array of char pointers representing the command-line arguments.
+Returns:
+- An int representing the status code of the program, 0 for success and non-zero for errors.
+*/
+int main(int argc, char** argv) {
+    if (argc != 6) {
+        cout << "Number of arguments entered are incorrect!" << endl;
+        return 1;
+    }
+
+    // Parse command line arguments
+    string targetImagePath = argv[1];
+    string databaseOrCsvPath = argv[2];
+    string featureType = argv[3];
+    string matchingMethod = argv[4];
+    int N = stoi(argv[5]);
+
+    // Read target image
+    Mat targetImage = imread(targetImagePath);
+    if (targetImage.empty()) {
+        cout << "Error: Unable to read target image." << endl;
+        return 1;
+    }
+
+    // Initialize variables for storing features and filenames
+    vector<pair<string, double>> matches;
+    vector<string> filenames;
+    vector<vector<double>> featureVectors;
+
+    // Compute features for the target image
+    vector<double> targetFeatures;
+    if (featureType == "baseline" || featureType == "histogram" || featureType == "Multi-Histogram" || featureType == "color_texture" || featureType == "task7") {
+        if (featureType == "baseline") {
+            targetFeatures = computeFeatures(targetImage);
+        } else if (featureType == "histogram") {
+            targetFeatures = computeHistogramFeatures(targetImage);
+        } else if (featureType == "Multi-Histogram") {
+            vector<double> topFeatures, bottomFeatures;
+            tie(topFeatures, bottomFeatures) = computeTopBottomHistograms(targetImage);
+            //auto [topFeatures, bottomFeatures] = computeTopBottomHistograms(targetImage);
+            targetFeatures.insert(targetFeatures.end(), topFeatures.begin(), topFeatures.end());
+            targetFeatures.insert(targetFeatures.end(), bottomFeatures.begin(), bottomFeatures.end());
+        } else if (featureType == "color_texture") {
+            vector<double> colorFeatures = computeHistogramFeatures(targetImage);
+            vector<double> textureFeatures = computeTextureFeatures(targetImage);
+            targetFeatures.insert(targetFeatures.end(), colorFeatures.begin(), colorFeatures.end());
+            targetFeatures.insert(targetFeatures.end(), textureFeatures.begin(), textureFeatures.end());
+        } else if (featureType == "task7") {
+            vector<double> redFeaturesTarget = computeRedSegmentationFeatures(targetImage);
+            // Step 2: Compute shape features for target image
+            vector<double> shapeFeaturesTarget = computeShapeFeatures(targetImage, redFeaturesTarget);
+            // Combine red and shape features for the target image
+            targetFeatures.insert(targetFeatures.end(), redFeaturesTarget.begin(), redFeaturesTarget.end());
+            targetFeatures.insert(targetFeatures.end(), shapeFeaturesTarget.begin(), shapeFeaturesTarget.end());
+        }
+    } else if (featureType == "csv") {
+        // If the feature type is CSV, read the CSV file
+        if (readCsv(databaseOrCsvPath, filenames, featureVectors) != 0) {
+            cerr << "Error reading CSV file." << endl;
+            return -1;
+        }
+
+        // Extract filename from the target image path for comparison
+        string targetFilename = targetImagePath.substr(targetImagePath.find_last_of("/\\") + 1);
+        bool foundTarget = false;
+        for (size_t i = 0; i < filenames.size(); i++) {
+            if (filenames[i] == targetFilename) {
+                targetFeatures = featureVectors[i];
+                foundTarget = true;
+                break;
+            }
+        }
+        if (!foundTarget) {
+            cerr << "Target image features not found in CSV." << endl;
+            return -1;
+        }
+    } else {
+        cerr << "Error: Unsupported feature type." << endl;
+        return 1;
+    }
+
+    string targetFilename = getFilename(targetImagePath);
+
+    if (featureType != "csv") {
+        // Read all image files in the database directory
+        vector<string> imageFiles;
+        glob(databaseOrCsvPath + "/*.jpg", imageFiles); 
+
+        // Compute features for each image in the database and calculate distance
+        for (const auto& imageFile : imageFiles) {
+            string currentFilename = getFilename(imageFile);
+            if (currentFilename == targetFilename) continue; 
+            Mat image = imread(imageFile);
+            if (image.empty()) {
+                cerr << "Warning: Unable to read image " << imageFile << endl;
+                continue;
+            }
+            // Compute features for the current image based on the specified feature type
+            vector<double> features;
+            if (featureType == "baseline") {
+                features = computeFeatures(image);
+            } else if (featureType == "histogram") {
+                features = computeHistogramFeatures(image);
+            } else if(featureType == "Multi-Histogram") {
+                vector<double> topFeatures, bottomFeatures;
+                tie(topFeatures, bottomFeatures) = computeTopBottomHistograms(image);
+                features.insert(features.end(), topFeatures.begin(), topFeatures.end());
+                features.insert(features.end(), bottomFeatures.begin(), bottomFeatures.end());
+            } 
+            else if (featureType == "color_texture") {
+                // Compute whole image color histogram features
+                vector<double> colorFeatures = computeHistogramFeatures(image);
+                vector<double> textureFeatures = computeTextureFeatures(image);
+                // Concatenate color and texture features
+                features.insert(features.end(), colorFeatures.begin(), colorFeatures.end());
+                features.insert(features.end(), textureFeatures.begin(), textureFeatures.end());
+            } else if (featureType == "task7") {
+                // Step 1: Compute red segmentation features for the current image
+                vector<double> redFeatures = computeRedSegmentationFeatures(image);
+                // Step 2: Compute shape features for the current image
+                vector<double> shapeFeatures = computeShapeFeatures(image, redFeatures);
+                // Combine red and shape features for the current image
+                features.insert(features.end(), redFeatures.begin(), redFeatures.end());
+                features.insert(features.end(), shapeFeatures.begin(), shapeFeatures.end());
+            }
+            else {
+                cerr << "Error: Unsupported feature type." << endl;
+                continue;
+            }
+            // Compute distance between target features and current image features based on the specified matching method
+            double distance;
+            if (matchingMethod == "sum_of_squared_difference") {
+                distance = computeDistance(targetFeatures, features);
+            } else if (matchingMethod == "histogram_intersection") {
+                distance = computeHistogramDistance(targetFeatures, features);
+            } 
+            else if (matchingMethod == "equal_weighting") {
+                distance = computeWeightedHistogramDistance(targetFeatures, features);
+            } else if (matchingMethod == "custom") {
+                distance = computeCustomDistance(targetFeatures, features);
+            }
+            else {
+                cerr << "Error: Unsupported matching method." << endl;
+                continue;
+            }
+            matches.push_back({imageFile, distance});
+        }
+    } 
+    else {
+            for (size_t i = 0; i < featureVectors.size(); i++) {
+            // Extract just the filename from the current path for accurate comparison
+            string currentFilename = getFilename(filenames[i]);
+            // Skip the iteration if the current file is the target image
+            if (currentFilename == targetFilename) continue;
+            // Initialize the distance variable
+            double distance = 0.0;
+            // Compute the distance based on the specified matching method
+            if (matchingMethod == "cosine") {
+            // Compute cosine similarity and convert it to distance
+                distance = 1.0 - computeCosineSimilarity(targetFeatures, featureVectors[i]);
+            } else {
+            // If the matching method is not supported, print an error and skip this iteration
+                cerr << "Error: Unsupported matching method for CSV mode." << endl;
+                continue;
+            }
+            // Add the filename and its corresponding distance to the matches vector
+            matches.push_back(make_pair(filenames[i], distance));
+        }
+    }
+
+    // Sort the matches based on distance/similarity
+    sort(matches.begin(), matches.end(), [](const auto& a, const auto& b) {
+        return a.second < b.second;
+    });
+
+    // top N matches,
+    cout << "Top " << N << " matching images:" << endl;
+    for (int i = 0; i < N && i < matches.size(); i++) {
+        cout << matches[i].first << " - Distance: " << matches[i].second << endl;
+    }
+
+    return 0;
+}
